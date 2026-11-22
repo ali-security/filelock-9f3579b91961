@@ -3,6 +3,7 @@ from __future__ import annotations
 __lazy_modules__ = ["contextlib", "filelock._util", "pathlib", "typing", "warnings"]
 
 import os
+import stat
 import sys
 import warnings
 from contextlib import suppress
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Final, cast
 
 from filelock._api import BaseFileLock
-from filelock._util import ensure_directory_exists, remove_own_file
+from filelock._util import ensure_directory_exists, foreign_owner, remove_own_file
 
 has_fcntl = False
 if sys.platform == "win32":  # pragma: win32 cover
@@ -186,6 +187,30 @@ else:  # pragma: win32 no cover
             try:
                 stat_result = os.fstat(fd)
                 if stat_result.st_nlink != 0:
+                    parent = Path(self.lock_file).parent.stat()
+                    # A callback may truncate the descriptor. Where the kernel lets an account link a file it does not
+                    # own (macOS, FreeBSD, Linux without fs.protected_hardlinks), another account that can write the
+                    # directory can link one of the caller's files to the lock path, so a second name could belong to
+                    # an unrelated file.
+                    #
+                    # A directory no other account can write holds only names the caller added. Refusing there would
+                    # let any account that can link the lock file elsewhere block the lock.
+                    if (
+                        stat_result.st_nlink > 1
+                        and self._on_acquired is not None
+                        and (parent.st_uid not in {os.geteuid(), 0} or parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+                    ):
+                        reason = (
+                            "lock file has another hard link where other accounts can write; on_acquired cannot take it"
+                        )
+                        raise PermissionError(EACCES, reason, self.lock_file)
+                    # The owner of a file under a sticky parent may unlink it during the hold. A contender then locks a
+                    # new inode at the path, and both hold the lock.
+                    if (owner := foreign_owner(stat_result, parent)) is not None:  # pragma: needs foreign-sticky-tmp
+                        reason = (
+                            f"lock file belongs to uid {owner}, not to this process's account or the directory's owner"
+                        )
+                        raise PermissionError(EACCES, reason, self.lock_file)
                     keep = True
             except OSError:
                 self._mark_descriptor_released()
