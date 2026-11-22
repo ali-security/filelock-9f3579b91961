@@ -18,6 +18,38 @@ def pin_pid_namespace(mocker: MockerFixture, namespace: int | OSError) -> None:
     _pin_namespace(mocker, Path("/proc/self/ns/pid"), namespace)
 
 
+def _pin_namespace(mocker: MockerFixture, link: Path, namespace: int | OSError) -> None:
+    answer = (
+        mocker.create_autospec(os.stat, side_effect=namespace)
+        if isinstance(namespace, OSError)
+        else mocker.create_autospec(os.stat, return_value=os.stat_result((0, namespace, 0, 0, 0, 0, 0, 0, 0, 0)))
+    )
+    # A plain function, not an autospec: a test that moves to another namespace pins again over this patch.
+    stat = Path.stat
+    mocker.patch.object(Path, "stat", new=lambda path, **kwargs: answer(path) if path == link else stat(path, **kwargs))
+
+
+def pin_proc_pid_namespace(  # pragma: linux cover
+    mocker: MockerFixture, self_link: str | OSError, status: str | OSError
+) -> None:
+    link = (
+        mocker.create_autospec(Path.readlink, side_effect=self_link)
+        if isinstance(self_link, OSError)
+        else mocker.create_autospec(Path.readlink, return_value=Path(self_link.format(pid=os.getpid())))
+    )
+    answer = (
+        mocker.create_autospec(Path.read_bytes, side_effect=status)
+        if isinstance(status, OSError)
+        else mocker.create_autospec(Path.read_bytes, return_value=status.format(pid=os.getpid()).encode())
+    )
+    readlink = Path.readlink
+    read_bytes = Path.read_bytes
+    mocker.patch.object(Path, "readlink", new=lambda path: link(path) if path == Path("/proc/self") else readlink(path))
+    mocker.patch.object(
+        Path, "read_bytes", new=lambda path: answer(path) if path == Path("/proc/self/status") else read_bytes(path)
+    )
+
+
 def pin_time_namespace(  # pragma: linux cover
     mocker: MockerFixture, namespace: int | OSError, offsets: str | OSError, *, for_children: int | None = None
 ) -> None:
