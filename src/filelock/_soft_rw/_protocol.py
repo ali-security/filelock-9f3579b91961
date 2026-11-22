@@ -211,13 +211,18 @@ class Ledger:
         self._clock = clock
         self._seen: dict[str, tuple[bytes | None, float]] = {}
 
-    def observe(self, key: str, value: bytes | None) -> float:
-        """Record *value* for *key* and return how long it has been unchanged."""
+    def observe(self, key: str, value: bytes | None, *, asked: float | None = None) -> float:
+        """
+        Record *value* for *key* and return for how long it has stayed the same.
+
+        *asked* is the clock reading taken before the caller fetched *value*. An unchanged value counts as unchanged up
+        to *asked*, so a pause between the fetch and this call adds no time.
+        """
         now = self._clock()
         if (seen := self._seen.get(key)) is None or seen[0] != value:
             self._seen[key] = (value, now)
             return 0.0
-        return now - seen[1]
+        return (now if asked is None else asked) - seen[1]
 
     def forget(self, key: str) -> None:
         self._seen.pop(key, None)
@@ -232,7 +237,7 @@ class GenerationLog:
 
     def __init__(self, files: Files, lock_file: str, root: str) -> None:
         self._files = files
-        self._lock_file = lock_file
+        self.lock_file = lock_file
         self._directory = Path(root, _GENERATIONS_DIRECTORY)
         self._epoch_path = str(self._directory / _EPOCH_NAME)
         self._head_path = str(self._directory / _HEAD_NAME)
@@ -255,7 +260,7 @@ class GenerationLog:
         # When everything the first pass named is gone, peers compacted past it while this client looked, or the log was
         # replaced; one more pass settles whether this client cannot see the head at all.
         if (latest := self._find()) is None and (latest := self._find()) is None:
-            raise SoftFileLockProtocolError(self._lock_file, None, "generation log names no readable snapshot")
+            raise SoftFileLockProtocolError(self.lock_file, None, "generation log names no readable snapshot")
         self._latest = latest
         return latest
 
@@ -311,21 +316,26 @@ class GenerationLog:
         return epoch
 
     def _list(self) -> list[int]:
-        # isdigit() alone admits Unicode digits: superscripts int() rejects, fullwidth ones it parses to another number.
-        listed = sorted(
-            int(name)
-            for name in self._files.listdir(str(self._directory))
-            if len(name) == _GENERATION_DIGITS and name.isascii() and name.isdigit()
-        )
+        listed = self._listed()
         for generation in listed[:-_RETAINED_GENERATIONS]:
             self._files.unlink(self._path(generation))
         return listed[-_RETAINED_GENERATIONS:]
 
+    def _listed(self) -> list[int]:
+        # isdigit() alone admits Unicode digits: superscripts int() rejects, fullwidth ones it parses to another number.
+        return sorted(
+            int(name)
+            for name in self._files.listdir(str(self._directory))
+            if len(name) == _GENERATION_DIGITS and name.isascii() and name.isdigit()
+        )
+
     def _probe(self, start: Snapshot, patience: int = _RETAINED_GENERATIONS) -> Snapshot:
         latest = start
         generation = start.generation
+        limit = generation + 2 * _RETAINED_GENERATIONS
         gap = 0
-        while gap < patience:
+        # A writer can keep adding records; the caller checks its deadline only after this probe returns.
+        while gap < patience and generation < limit:
             generation += 1
             if (snapshot := self._read(generation)) is None:
                 gap += 1
@@ -339,7 +349,7 @@ class GenerationLog:
             return None
         if (snapshot := parse_snapshot(data)) is None or snapshot.generation != generation:
             name = self._name(generation)
-            raise SoftFileLockProtocolError(self._lock_file, name, "malformed generation record")
+            raise SoftFileLockProtocolError(self.lock_file, name, "malformed generation record")
         return snapshot
 
     def commit(self, successor: Snapshot) -> bool:
@@ -352,8 +362,11 @@ class GenerationLog:
         changed since the snapshot was read is a different log, so the commit is refused as lost and the caller
         re-reads; that narrows a wipe racing this commit to the moment between the epoch check and the link. A slot
         compaction freed is refused the same way, before the link and again after it, since a committer can stall in
-        between. A record refused after it landed is removed: it is the oldest survivor by then, and a legitimate one
-        was about to be compacted.
+        between. After the link a surviving predecessor proves little: it may be a record another stalled committer
+        linked into its own freed slot and has yet to remove. A slot comes free once the log is a whole window past it,
+        and the head stays, so a record the listing or ``HEAD`` leads by a window is refused as well. A record refused
+        after it landed is removed when nothing was built on it. One that peers lead by less than a window stays, or its
+        slot would come free early.
         """
         if self._files.read(self._epoch_path) != self._epoch or not self._extends_the_log(successor.generation):
             return False
@@ -361,8 +374,10 @@ class GenerationLog:
             self._path(successor.generation), data := successor.encode(), self._files.link, durable=True
         ):
             return False
-        if not self._extends_the_log(successor.generation):
-            self._files.unlink(self._path(successor.generation))
+        lead = max([*self._listed(), self._head_generation() or 0]) - successor.generation
+        if lead >= _RETAINED_GENERATIONS or not self._extends_the_log(successor.generation):
+            if not 0 < lead < _RETAINED_GENERATIONS:
+                self._files.unlink(self._path(successor.generation))
             return False
         self._latest = successor
         # Readers verify the generation HEAD names, so a failed rename costs a probe, not the commit. A late one would
@@ -379,7 +394,7 @@ class GenerationLog:
         return True
 
     def _extends_the_log(self, generation: int) -> bool:
-        # Compaction removes oldest first, so a surviving predecessor proves this slot was never freed. The first
+        # Compaction removes oldest first, so a missing predecessor means compaction freed this slot. The first
         # generation has none; a HEAD of this epoch means the log already moved past it.
         if generation > 1:
             return self._files.read(self._path(generation - 1)) is not None
@@ -552,8 +567,9 @@ class Participant:
         return self._unchanged_for_its_lease(token, self._holder_path(token))
 
     def _unchanged_for_its_lease(self, key: str, path: str) -> bool:
+        asked = self._clock()
         record = self._files.read(path)
-        return self._ledger.observe(key, record) >= max(self._stale_threshold, holder_lease(record) or 0.0)
+        return self._ledger.observe(key, record, asked=asked) >= max(self._stale_threshold, holder_lease(record) or 0.0)
 
     def _holder_path(self, token: str) -> str:
         return str(Path(self._root, _HOLDERS_DIRECTORY, token))
@@ -591,6 +607,8 @@ class Participant:
         # The record goes even when the log cannot be read: a contender that never entered then leaves nothing behind,
         # and a member still named ages out the same way with or without one.
         # A tree that was swapped out leaves no record this participant can reach, so there is nothing to commit out of.
+        # Peers may evict this record after its stale threshold, so retrying longer cannot preserve the hold.
+        give_up = self._clock() + self._stale_threshold
         with suppress(TreeReplacedError):
             try:
                 while self.token in (latest := self._log.latest()).members:
@@ -601,6 +619,9 @@ class Participant:
                     )
                     if self._log.commit(successor):
                         break
+                    if self._clock() >= give_up:
+                        msg = "could not withdraw holder from generation log before its stale threshold"
+                        raise SoftFileLockProtocolError(self._log.lock_file, None, msg)
             finally:
                 self._entered = False
                 self.generation = None

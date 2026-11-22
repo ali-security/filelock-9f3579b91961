@@ -26,6 +26,7 @@ from capabilities import CAPABILITIES
 
 from filelock import SoftFileLockProtocolError
 from filelock._soft_rw._protocol import (
+    _RETAINED_GENERATIONS,
     GenerationLog,
     Ledger,
     Participant,
@@ -166,6 +167,14 @@ def test_ledger_measures_how_long_a_value_stays_unchanged() -> None:
     assert ledger.observe("a", None) == pytest.approx(0.0)
 
 
+def test_ledger_counts_no_time_past_the_moment_the_observer_asked() -> None:
+    clock = [10.0]
+    ledger = Ledger(lambda: clock[0])
+    assert ledger.observe("a", b"1", asked=4.0) == pytest.approx(0.0)
+    clock[0] = 50.0
+    assert ledger.observe("a", b"1", asked=12.5) == pytest.approx(2.5)
+
+
 def test_ledger_retain_forgets_everything_else() -> None:
     clock = [0.0]
     ledger = Ledger(lambda: clock[0])
@@ -299,6 +308,36 @@ def test_leave_retries_a_commit_a_peer_won(lock_file: str, files: OsFiles, root:
 
 
 @pytest.mark.requires_hard_links
+def test_leave_stops_retrying_after_stale_threshold(
+    lock_file: str, files: OsFiles, root: str, mocker: MockerFixture
+) -> None:
+    now = 0.0
+
+    def clock() -> float:
+        return now
+
+    reader = _participant(files, lock_file, "read", stale_threshold=2, clock=clock)
+    reader.publish()
+    assert reader.advance()
+    lost = []
+
+    def lose_commit(_log: GenerationLog, successor: Snapshot) -> bool:
+        nonlocal now
+        lost.append(successor)
+        now += 1
+        return False
+
+    mocker.patch.object(GenerationLog, "commit", autospec=True, side_effect=lose_commit)
+    with pytest.raises(SoftFileLockProtocolError, match="could not withdraw holder") as caught:
+        reader.leave()
+
+    assert caught.value.lock_file == lock_file
+    assert len(lost) == 2
+    assert not Path(root, "holders", reader.token).exists()
+    assert reader.generation is None
+
+
+@pytest.mark.requires_hard_links
 def test_waiting_contender_republishes_a_swept_record(lock_file: str, files: OsFiles, root: str) -> None:
     # A record removed out from under a contender (a sweeper that mistook it, an operator) comes back on its next poll,
     # so peers always have a record to watch by the time the contender is admitted.
@@ -408,6 +447,23 @@ def test_latest_probes_across_a_compaction_hole(lock_file: str, files: OsFiles, 
     Path(root, "gen", f"{3:020d}").unlink()
     behind = GenerationLog(files, lock_file, root)
     assert behind.latest().generation == 5
+
+
+def test_probe_stops_following_continuous_growth(
+    lock_file: str, files: OsFiles, root: str, mocker: MockerFixture
+) -> None:
+    log = GenerationLog(files, lock_file, root)
+    reads = []
+
+    def read_next(generation: int) -> Snapshot:
+        reads.append(generation)
+        return Snapshot(generation=generation, writer=None, readers=frozenset())
+
+    mocker.patch.object(log, "_read", autospec=True, side_effect=read_next)
+    latest = log._probe(Snapshot(generation=0, writer=None, readers=frozenset()))
+
+    assert latest.generation == 2 * _RETAINED_GENERATIONS
+    assert len(reads) == latest.generation
 
 
 def test_a_listing_naming_only_compacted_generations_fails_closed(
@@ -609,6 +665,75 @@ def test_a_commit_that_lands_in_a_compacted_slot_counts_as_lost(
 
 
 @pytest.mark.requires_hard_links
+@pytest.mark.parametrize("witness", ["listing", "head"])
+def test_a_commit_beside_another_late_record_counts_as_lost(
+    lock_file: str, files: OsFiles, root: str, head: Path, mocker: MockerFixture, witness: str
+) -> None:
+    # Two committers stalled before their links to adjacent slots. The one below has put its record back into gen/3 and
+    # not yet removed it, so the predecessor check passes; either the listing or HEAD alone must still refuse gen/4.
+    log = _committed(files, lock_file, root, [None] * 3)
+    stale_head, stale_listing, real_link = head.read_bytes(), files.listdir(str(head.parent)), files.link
+
+    def peers_compact_then_both_link(source: str, target: str) -> bool:
+        _committed(OsFiles(lock_file), lock_file, root, [None] * 70)
+        Path(root, "gen", f"{3:020d}").write_bytes(Snapshot(generation=3, writer=None, readers=frozenset()).encode())
+        if witness == "listing":
+            head.write_bytes(stale_head)
+        else:
+            mocker.patch.object(OsFiles, "listdir", autospec=True, return_value=stale_listing)
+        return real_link(source, target)
+
+    mocker.patch.object(files, "link", autospec=True, side_effect=peers_compact_then_both_link)
+    assert (
+        log.commit(Snapshot(generation=4, writer=_FIRST, readers=frozenset())),
+        Path(root, "gen", f"{4:020d}").exists(),
+    ) == (False, False)
+
+
+@pytest.mark.requires_hard_links
+@pytest.mark.parametrize("generation", [pytest.param(1, id="first"), pytest.param(3, id="later")])
+def test_a_record_refused_inside_the_window_keeps_its_slot(
+    lock_file: str, files: OsFiles, root: str, mocker: MockerFixture, generation: int
+) -> None:
+    # Removing it would free a slot the log is not a window past, for a committer stalled before its link to take.
+    log = _committed(files, lock_file, root, [None] * (generation - 1))
+    log.latest()
+    real_link = files.link
+
+    def link_then_peers_commit(source: str, target: str) -> bool:
+        landed = real_link(source, target)
+        _committed(OsFiles(lock_file), lock_file, root, [None])
+        Path(root, "gen", f"{generation - 1:020d}").unlink(missing_ok=True)
+        return landed
+
+    mocker.patch.object(files, "link", autospec=True, side_effect=link_then_peers_commit)
+    assert (
+        log.commit(Snapshot(generation=generation, writer=_FIRST, readers=frozenset())),
+        Path(root, "gen", f"{generation:020d}").exists(),
+    ) == (False, True)
+
+
+@pytest.mark.requires_hard_links
+def test_a_record_refused_with_nothing_built_on_it_is_removed(
+    lock_file: str, files: OsFiles, root: str, mocker: MockerFixture
+) -> None:
+    # A peer replaced the log after the epoch check: left behind, gen/6 would pass for the head of the new log.
+    log = _committed(files, lock_file, root, [None] * 5)
+    real_create = files.create
+
+    def wipe_then_create(path: str, data: bytes, *, durable: bool = False) -> tuple[int, int]:
+        shutil.rmtree(root)
+        _committed(OsFiles(lock_file), lock_file, root, [_SECOND])
+        return real_create(path, data, durable=durable)
+
+    mocker.patch.object(files, "create", autospec=True, side_effect=wipe_then_create)
+    assert (
+        log.commit(Snapshot(generation=6, writer=_FIRST, readers=frozenset())),
+        Path(root, "gen", f"{6:020d}").exists(),
+    ) == (False, False)
+
+
+@pytest.mark.requires_hard_links
 def test_a_late_head_rename_never_moves_head_back(
     lock_file: str, files: OsFiles, root: str, head: Path, mocker: MockerFixture
 ) -> None:
@@ -706,6 +831,33 @@ def test_a_tighter_peer_waits_out_the_holders_own_lease(lock_file: str, files: O
     assert not peer.advance()
     clock[0] = 11.0
     assert peer.advance()
+
+
+@pytest.mark.requires_hard_links
+def test_a_contender_suspended_after_its_read_does_not_evict_a_live_holder(
+    lock_file: str, files: OsFiles, root: str, mocker: MockerFixture
+) -> None:
+    # The stop lands between the read of the holder's record and the clock sample that follows it; the holder keeps
+    # heartbeating throughout, so the bytes the contender resumes with are stale, not the holder.
+    clock = [0.0]
+    holder = _participant(files, lock_file, "write", stale_threshold=10, clock=lambda: clock[0])
+    holder.publish()
+    assert holder.advance()
+    peer = _participant(files, lock_file, "write", stale_threshold=10, clock=lambda: clock[0])
+    peer.publish()
+    assert not peer.advance()
+    record, real_read = str(Path(root, "holders", holder.token)), files.read
+
+    def read_then_sleep_through_a_heartbeat(path: str) -> bytes | None:
+        data = real_read(path)
+        if path == record:
+            clock[0] += 11.0
+            assert holder.heartbeat() == ("ok", None)
+        return data
+
+    mocker.patch.object(files, "read", autospec=True, side_effect=read_then_sleep_through_a_heartbeat)
+    assert not peer.advance()
+    assert holder.heartbeat() == ("ok", None)
 
 
 @pytest.mark.requires_hard_links
